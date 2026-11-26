@@ -23,6 +23,7 @@ const MODEL_PRICING = {
 export const STAGE_CREDIT_COST = {
   cache_hit: 0,
   web_free: 0,
+  ocr_free: 0,
   caption_lite: 0.25,
   audio_compressed: 1,
   video_visual: 2,

@@ -12,6 +12,12 @@ import {
   recordUsage,
   setCachedRecipe,
 } from './usageStore.mjs';
+import {
+  hasTesseractBinary,
+  ocrImageBuffer,
+  ocrVideoKeyframes,
+  parseRecipeFromOcrText,
+} from './ocrEngine.mjs';
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -769,6 +775,7 @@ async function handleAnalyzeVideoUrl(req, res) {
     const body = await readJsonBody(req, 1024 * 1024);
     const rawUrl = String(body.url || '').trim();
     const forceRefresh = Boolean(body.forceRefresh);
+    const preferOcr = body.preferOcr !== false;
     const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
 
     if (!isSafeExternalUrl(normalizedUrl)) {
@@ -809,7 +816,11 @@ async function handleAnalyzeVideoUrl(req, res) {
       return;
     }
 
-    const [ytDlp, ffmpegReady] = await Promise.all([resolveYtDlpBinary(), hasFfmpegBinary()]);
+    const [ytDlp, ffmpegReady, tesseractReady] = await Promise.all([
+      resolveYtDlpBinary(),
+      hasFfmpegBinary(),
+      hasTesseractBinary(),
+    ]);
     const isYouTube = /(?:youtube\.com|youtu\.be)/i.test(normalizedUrl);
     const isInstagram = /instagram\.com/i.test(normalizedUrl);
 
@@ -827,36 +838,64 @@ async function handleAnalyzeVideoUrl(req, res) {
       }
     }
 
-    // STAGE 1: If description already contains full ingredients + steps -> tiny text-only call!
+    // STAGE 1: If description already contains full ingredients + steps -> 0 TL parser first if preferOcr!
     if (meta?.description && captionLooksLikeCompleteRecipe(meta.description)) {
-      const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
-        kind: 'text',
-        prompt: `${RECIPE_JSON_PROMPT}\n\nAşağıdaki gönderi açıklamasından tarifi eksiksiz çıkar. Eğer açıklama yetersizse needsVisualAnalysis: true döndür.\n\nBaşlık: ${meta.title || ''}\nAçıklama:\n${meta.description.slice(0, 6000)}`,
-      });
-
-      if (!parsed.needsVisualAnalysis && Array.isArray(parsed.ingredients) && parsed.ingredients.length >= 2) {
-        const draft = normalizeGeminiRecipe(parsed, {
+      if (preferOcr) {
+        const ocrParsed = parseRecipeFromOcrText(meta.description, {
           title: meta.title,
           imageUri: meta.thumbnail,
           sourceUrl: normalizedUrl,
         });
-        setCachedRecipe(normalizedUrl, draft);
-        const usage = recordUsage({
-          userId,
-          stage: 'caption_lite',
-          model: usedModel || GEMINI_TEXT_MODEL,
-          promptTokens,
-          outputTokens,
-          freeStarterCredits: FREE_STARTER_CREDITS,
+        if (ocrParsed._ocrQuality.ingredientCount >= 2 && ocrParsed._ocrQuality.stepCount >= 1) {
+          const { _ocrQuality, ...draft } = ocrParsed;
+          setCachedRecipe(normalizedUrl, draft);
+          const usage = recordUsage({
+            userId,
+            stage: 'ocr_free',
+            model: 'none',
+            freeStarterCredits: FREE_STARTER_CREDITS,
+          });
+          sendJson(res, 200, {
+            ok: true,
+            analysisMode: 'ocr_free',
+            costNote: 'Aşama 1 (Ücretsiz Açıklama Ayrıştırıcı): 0 TL maliyetle çözüldü.',
+            draft,
+            usage,
+          });
+          return;
+        }
+      }
+
+      if (getActiveProvider() !== 'none') {
+        const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+          kind: 'text',
+          prompt: `${RECIPE_JSON_PROMPT}\n\nAşağıdaki gönderi açıklamasından tarifi eksiksiz çıkar. Eğer açıklama yetersizse needsVisualAnalysis: true döndür.\n\nBaşlık: ${meta.title || ''}\nAçıklama:\n${meta.description.slice(0, 6000)}`,
         });
-        sendJson(res, 200, {
-          ok: true,
-          analysisMode: 'caption_lite',
-          costNote: 'Aşama 1 (Ekonomik Metin): Açıklamadan çözüldü (~%95 maliyet tasarrufu).',
-          draft,
-          usage,
-        });
-        return;
+
+        if (!parsed.needsVisualAnalysis && Array.isArray(parsed.ingredients) && parsed.ingredients.length >= 2) {
+          const draft = normalizeGeminiRecipe(parsed, {
+            title: meta.title,
+            imageUri: meta.thumbnail,
+            sourceUrl: normalizedUrl,
+          });
+          setCachedRecipe(normalizedUrl, draft);
+          const usage = recordUsage({
+            userId,
+            stage: 'caption_lite',
+            model: usedModel || GEMINI_TEXT_MODEL,
+            promptTokens,
+            outputTokens,
+            freeStarterCredits: FREE_STARTER_CREDITS,
+          });
+          sendJson(res, 200, {
+            ok: true,
+            analysisMode: 'caption_lite',
+            costNote: 'Aşama 1 (Ekonomik Metin): Açıklamadan çözüldü (~%95 maliyet tasarrufu).',
+            draft,
+            usage,
+          });
+          return;
+        }
       }
     }
 
@@ -928,6 +967,59 @@ async function handleAnalyzeVideoUrl(req, res) {
     }
 
     if (downloadedVideoPath && ffmpegReady && downloadedTmpDir) {
+      // STAGE 1.5 (0 TL OCR): Extract keyframes & read on-screen Turkish/English recipe text with Tesseract!
+      if (preferOcr && tesseractReady) {
+        try {
+          const ocrRes = await ocrVideoKeyframes(downloadedVideoPath, downloadedTmpDir);
+          const mergedText = [title, caption, ocrRes.text].filter(Boolean).join('\n\n');
+          const ocrParsed = parseRecipeFromOcrText(mergedText, {
+            title,
+            imageUri: thumbnail,
+            sourceUrl: normalizedUrl,
+          });
+
+          if (ocrParsed._ocrQuality.ingredientCount >= 2 && ocrParsed._ocrQuality.stepCount >= 1) {
+            const { _ocrQuality, ...draft } = ocrParsed;
+            setCachedRecipe(normalizedUrl, draft);
+            const usage = recordUsage({
+              userId,
+              stage: 'ocr_free',
+              model: 'none',
+              freeStarterCredits: FREE_STARTER_CREDITS,
+            });
+            sendJson(res, 200, {
+              ok: true,
+              analysisMode: 'ocr_free',
+              costNote: `Ücretsiz Tesseract Video OCR (${ocrRes.frameCount} kare tarandı, 0 TL maliyet).`,
+              draft,
+              usage,
+            });
+            return;
+          }
+
+          // If OCR extracted decent text (>=80 chars) and no AI provider is configured, still return OCR result!
+          if (ocrParsed._ocrQuality.charCount >= 60 && getActiveProvider() === 'none') {
+            const { _ocrQuality, ...draft } = ocrParsed;
+            const usage = recordUsage({
+              userId,
+              stage: 'ocr_free',
+              model: 'none',
+              freeStarterCredits: FREE_STARTER_CREDITS,
+            });
+            sendJson(res, 200, {
+              ok: true,
+              analysisMode: 'ocr_free',
+              costNote: `Ücretsiz Tesseract Video OCR (${ocrRes.frameCount} kare, 0 TL). Eksik alanları düzenleyebilirsiniz.`,
+              draft,
+              usage,
+            });
+            return;
+          }
+        } catch {
+          // Proceed to Stage 2 AI audio analysis if OCR fails
+        }
+      }
+
       // Try Stage 2: Extract tiny 32kbps mono MP3 speech first!
       try {
         const mp3Path = await compressToSpeechMp3(downloadedVideoPath, downloadedTmpDir);
@@ -1062,6 +1154,7 @@ async function handleAnalyzeMedia(req, res) {
     const base64 = String(body.base64 || '').trim();
     const mimeType = String(body.mimeType || 'video/mp4').trim();
     const fileName = String(body.fileName || 'tarif-medya').trim();
+    const preferOcr = body.preferOcr !== false;
 
     if (!base64) {
       sendJson(res, 400, { ok: false, error: 'Yüklenecek video veya fotoğraf seçilmedi.' });
@@ -1070,8 +1163,42 @@ async function handleAnalyzeMedia(req, res) {
 
     const cleanBase64 = base64.includes(',') ? base64.split(',')[1] : base64;
     const buffer = Buffer.from(cleanBase64, 'base64');
+    const [ffmpegReady, tesseractReady] = await Promise.all([
+      hasFfmpegBinary(),
+      hasTesseractBinary(),
+    ]);
 
     if (mimeType.startsWith('image/') && buffer.length < 12 * 1024 * 1024) {
+      // 0 TL Tesseract OCR for recipe photos / screenshots first!
+      if (preferOcr && tesseractReady) {
+        fs.mkdirSync(LOCAL_TMP_ROOT, { recursive: true });
+        const tmpDir = fs.mkdtempSync(path.join(LOCAL_TMP_ROOT, 'ocr-img-'));
+        tmpDirs.push(tmpDir);
+        const ext = mimeType.includes('png') ? '.png' : '.jpg';
+        const ocrText = await ocrImageBuffer(buffer, tmpDir, ext);
+        if (ocrText.trim().length >= 25) {
+          const ocrParsed = parseRecipeFromOcrText(ocrText, {
+            imageUri: `data:${mimeType};base64,${cleanBase64}`,
+          });
+          const { _ocrQuality, ...draft } = ocrParsed;
+          draft.sourceType = 'manual';
+          const usage = recordUsage({
+            userId,
+            stage: 'ocr_free',
+            model: 'none',
+            freeStarterCredits: FREE_STARTER_CREDITS,
+          });
+          sendJson(res, 200, {
+            ok: true,
+            analysisMode: 'ocr_free',
+            costNote: 'Ücretsiz Tesseract Fotoğraf OCR ile okundu (0 TL maliyet).',
+            draft,
+            usage,
+          });
+          return;
+        }
+      }
+
       const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
         kind: 'image',
         base64: cleanBase64,
@@ -1093,15 +1220,14 @@ async function handleAnalyzeMedia(req, res) {
       sendJson(res, 200, {
         ok: true,
         analysisMode: 'image_ai',
-        costNote: 'Fotoğraf/ekran görüntüsü analiz edildi.',
+        costNote: 'Fotoğraf/ekran görüntüsü yapay zekâ ile analiz edildi.',
         draft,
         usage,
       });
       return;
     }
 
-    // Uploaded video: apply same cost-saving compression with ffmpeg when available!
-    const ffmpegReady = await hasFfmpegBinary();
+    // Uploaded video: try 0 TL Tesseract Keyframe OCR first when preferOcr is enabled!
     let finalBuf = buffer;
     let finalMime = mimeType;
 
@@ -1111,6 +1237,39 @@ async function handleAnalyzeMedia(req, res) {
       tmpDirs.push(tmpDir);
       const inPath = path.join(tmpDir, 'input.mp4');
       fs.writeFileSync(inPath, buffer);
+
+      if (preferOcr && tesseractReady) {
+        try {
+          const ocrRes = await ocrVideoKeyframes(inPath, tmpDir);
+          if (ocrRes.text.trim().length >= 40) {
+            const ocrParsed = parseRecipeFromOcrText(ocrRes.text);
+            if (
+              (ocrParsed._ocrQuality.ingredientCount >= 2 && ocrParsed._ocrQuality.stepCount >= 1) ||
+              getActiveProvider() === 'none'
+            ) {
+              const { _ocrQuality, ...draft } = ocrParsed;
+              draft.sourceType = 'manual';
+              const usage = recordUsage({
+                userId,
+                stage: 'ocr_free',
+                model: 'none',
+                freeStarterCredits: FREE_STARTER_CREDITS,
+              });
+              sendJson(res, 200, {
+                ok: true,
+                analysisMode: 'ocr_free',
+                costNote: `Ücretsiz Tesseract Video OCR (${ocrRes.frameCount} kare tarandı, 0 TL maliyet).`,
+                draft,
+                usage,
+              });
+              return;
+            }
+          }
+        } catch {
+          // Fall through to AI video analysis
+        }
+      }
+
       try {
         const compactPath = await compressToLowFpsVideo(inPath, tmpDir);
         finalBuf = fs.readFileSync(compactPath);
@@ -1234,17 +1393,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (reqUrl.startsWith('/api/capabilities')) {
-    const [ytDlp, ffmpeg] = await Promise.all([resolveYtDlpBinary(), hasFfmpegBinary()]);
+    const [ytDlp, ffmpeg, tesseract] = await Promise.all([
+      resolveYtDlpBinary(),
+      hasFfmpegBinary(),
+      hasTesseractBinary(),
+    ]);
     const userId = String(req.headers['x-user-id'] || 'default-user').slice(0, 64);
     const metrics = loadMetrics();
     const today = new Date().toISOString().slice(0, 10);
     const provider = getActiveProvider();
     sendJson(res, 200, {
       ok: true,
-      serverConfigured: provider !== 'none',
+      serverConfigured: provider !== 'none' || tesseract,
       provider,
       hasYtDlp: Boolean(ytDlp),
       hasFfmpeg: ffmpeg,
+      hasTesseract: tesseract,
       textModel: provider === 'openrouter' ? OPENROUTER_TEXT_MODEL : GEMINI_TEXT_MODEL,
       mediaModel: provider === 'openrouter' ? OPENROUTER_MEDIA_MODEL : GEMINI_MEDIA_MODEL,
       payAsYouGo: {
