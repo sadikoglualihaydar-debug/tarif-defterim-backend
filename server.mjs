@@ -41,22 +41,29 @@ function loadDotEnv() {
 loadDotEnv();
 
 const PORT = Number(process.env.PORT) || 8081;
-const GEMINI_TEXT_MODEL = (process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash-lite').trim();
-const GEMINI_MEDIA_MODEL = (process.env.GEMINI_MEDIA_MODEL || 'gemini-2.5-flash').trim();
+const GEMINI_TEXT_MODEL = (process.env.GEMINI_TEXT_MODEL || 'gemini-3.8-flash').trim();
+const GEMINI_MEDIA_MODEL = (process.env.GEMINI_MEDIA_MODEL || 'gemini-3.8-flash').trim();
+const OPENROUTER_TEXT_MODEL = (
+  process.env.OPENROUTER_TEXT_MODEL || 'google/gemini-2.5-flash'
+).trim();
+const OPENROUTER_MEDIA_MODEL = (
+  process.env.OPENROUTER_MEDIA_MODEL || 'google/gemini-2.5-flash'
+).trim();
 const DAILY_BUDGET_USD = Number(process.env.DAILY_BUDGET_USD || 5.0);
 const APP_CLIENT_TOKEN = (process.env.APP_CLIENT_TOKEN || '').trim();
 const REQUIRE_CREDITS = String(process.env.REQUIRE_CREDITS || 'false').toLowerCase() === 'true';
 const FREE_STARTER_CREDITS = Number(process.env.FREE_STARTER_CREDITS || 10);
 
-function getGeminiApiKey() {
-  if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
-    return process.env.GEMINI_API_KEY.trim();
+function readEnvKey(keyName) {
+  if (process.env[keyName] && process.env[keyName].trim()) {
+    return process.env[keyName].trim().replace(/^["']|["']$/g, '');
   }
   const envPath = path.join(__dirname, '.env');
   if (fs.existsSync(envPath)) {
     const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+    const re = new RegExp(`^\\s*${keyName}\\s*=\\s*(.+)\\s*$`);
     for (const line of lines) {
-      const m = line.match(/^\s*GEMINI_API_KEY\s*=\s*(.+)\s*$/);
+      const m = line.match(re);
       if (m?.[1]) {
         const val = m[1].trim().replace(/^["']|["']$/g, '');
         if (val) return val;
@@ -64,6 +71,20 @@ function getGeminiApiKey() {
     }
   }
   return '';
+}
+
+function getOpenRouterApiKey() {
+  return readEnvKey('OPENROUTER_API_KEY');
+}
+
+function getGeminiApiKey() {
+  return readEnvKey('GEMINI_API_KEY');
+}
+
+function getActiveProvider() {
+  if (getOpenRouterApiKey()) return 'openrouter';
+  if (getGeminiApiKey()) return 'gemini';
+  return 'none';
 }
 
 const VALID_CATEGORIES = new Set([
@@ -252,6 +273,165 @@ function parseJsonFromGeminiText(text) {
   return JSON.parse(cleaned);
 }
 
+async function callOpenRouter(model, contentBlocks) {
+  const apiKey = getOpenRouterApiKey();
+  if (!apiKey) {
+    throw new Error('Sunucuda OPENROUTER_API_KEY tanımlı değil.');
+  }
+
+  const fallbackModels = (
+    process.env.OPENROUTER_FALLBACK_MODELS ||
+    'google/gemini-3.8-flash,google/gemini-flash-latest,google/gemini-2.5-flash'
+  )
+    .split(',')
+    .map((m) => m.trim())
+    .filter((m) => m && m !== model);
+
+  const candidates = [model, ...fallbackModels];
+  let lastError = new Error('OpenRouter API yanıt vermedi.');
+
+  for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+    const activeModel = candidates[cIdx];
+    const maxAttempts = cIdx === 0 ? 2 : 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://tarif-defterim-api.onrender.com',
+          'X-Title': 'Tarif Defterim',
+        },
+        body: JSON.stringify({
+          model: activeModel,
+          temperature: 0.2,
+          response_format: { type: 'json_object' },
+          messages: [{ role: 'user', content: contentBlocks }],
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        const rawContent = data?.choices?.[0]?.message?.content;
+        const text = Array.isArray(rawContent)
+          ? rawContent.map((c) => c.text || '').join('').trim()
+          : String(rawContent || '').trim();
+        if (!text) {
+          throw new Error('OpenRouter boş yanıt döndürdü.');
+        }
+
+        const usage = data?.usage || {};
+        return {
+          parsed: parseJsonFromGeminiText(text),
+          promptTokens: Number(usage.prompt_tokens || 0),
+          outputTokens: Number(usage.completion_tokens || 0),
+          usedModel: data?.model || activeModel,
+        };
+      }
+
+      const msg =
+        data?.error?.metadata?.raw ||
+        data?.error?.message ||
+        `OpenRouter API hatası (HTTP ${res.status})`;
+      lastError = new Error(String(msg));
+
+      const isRetryable =
+        res.status === 503 ||
+        res.status === 429 ||
+        res.status === 502 ||
+        /high demand|overloaded|rate limit|temporarily/i.test(String(msg));
+
+      if (isRetryable && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+
+      if (isRetryable || res.status === 404 || res.status === 400) {
+        break;
+      }
+
+      throw lastError;
+    }
+  }
+
+  throw lastError;
+}
+
+async function analyzeWithAi({
+  kind,
+  prompt,
+  buffer,
+  base64,
+  mimeType = 'video/mp4',
+  fileName = 'media.mp4',
+  youtubeUrl,
+  uploadedFiles,
+}) {
+  const provider = getActiveProvider();
+  if (provider === 'none') {
+    throw new Error(
+      'Sunucuda OPENROUTER_API_KEY veya GEMINI_API_KEY tanımlı değil. Render Environment sekmesine anahtarınızı ekleyin.'
+    );
+  }
+
+  if (provider === 'openrouter') {
+    const model = kind === 'text' ? OPENROUTER_TEXT_MODEL : OPENROUTER_MEDIA_MODEL;
+    const blocks = [];
+
+    if (kind === 'audio' && buffer) {
+      blocks.push({
+        type: 'input_audio',
+        input_audio: {
+          data: buffer.toString('base64'),
+          format: mimeType.includes('wav') ? 'wav' : 'mp3',
+        },
+      });
+    } else if (kind === 'video' && buffer) {
+      blocks.push({
+        type: 'video_url',
+        video_url: {
+          url: `data:${mimeType || 'video/mp4'};base64,${buffer.toString('base64')}`,
+        },
+      });
+    } else if (kind === 'youtube' && youtubeUrl) {
+      blocks.push({
+        type: 'video_url',
+        video_url: { url: youtubeUrl },
+      });
+    } else if (kind === 'image' && base64) {
+      blocks.push({
+        type: 'image_url',
+        image_url: { url: `data:${mimeType};base64,${base64}` },
+      });
+    }
+
+    blocks.push({ type: 'text', text: prompt });
+    return callOpenRouter(model, blocks);
+  }
+
+  // Direct Google Gemini API path
+  const model = kind === 'text' ? GEMINI_TEXT_MODEL : GEMINI_MEDIA_MODEL;
+  if (kind === 'text') {
+    return callGemini(model, [{ text: prompt }]);
+  }
+  if (kind === 'youtube' && youtubeUrl) {
+    return callGemini(model, [{ fileData: { fileUri: youtubeUrl } }, { text: prompt }]);
+  }
+  if (kind === 'image' && base64) {
+    return callGemini(model, [{ inlineData: { mimeType, data: base64 } }, { text: prompt }]);
+  }
+  if ((kind === 'audio' || kind === 'video') && buffer) {
+    const uploaded = await uploadBufferToGeminiFiles(buffer, mimeType, fileName);
+    if (Array.isArray(uploadedFiles)) uploadedFiles.push(uploaded.name);
+    return callGemini(model, [
+      { fileData: { mimeType: uploaded.mimeType || mimeType, fileUri: uploaded.uri } },
+      { text: prompt },
+    ]);
+  }
+  throw new Error('Geçersiz analiz türü.');
+}
+
 async function callGemini(model, parts) {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {
@@ -260,41 +440,77 @@ async function callGemini(model, parts) {
     );
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-    apiKey
-  )}`;
+  const fallbackModels = (process.env.GEMINI_FALLBACK_MODELS || 'gemini-3.7-flash,gemini-3.6-flash')
+    .split(',')
+    .map((m) => m.trim())
+    .filter((m) => m && m !== model);
 
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        temperature: 0.2,
-        responseMimeType: 'application/json',
-      },
-    }),
-  });
+  const candidates = [model, ...fallbackModels];
+  let lastError = new Error('Gemini API yanıt vermedi.');
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error?.message || `Gemini API hatası (HTTP ${res.status})`);
+  for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+    const activeModel = candidates[cIdx];
+    const maxAttempts = cIdx === 0 ? 3 : 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${activeModel}:generateContent?key=${encodeURIComponent(
+        apiKey
+      )}`;
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            temperature: 0.2,
+            responseMimeType: 'application/json',
+          },
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        const text = data?.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || '')
+          .join('')
+          .trim();
+        if (!text) {
+          throw new Error('Gemini boş yanıt döndürdü.');
+        }
+
+        const usageMeta = data?.usageMetadata || {};
+        return {
+          parsed: parseJsonFromGeminiText(text),
+          promptTokens: Number(usageMeta.promptTokenCount || 0),
+          outputTokens: Number(usageMeta.candidatesTokenCount || 0),
+          usedModel: activeModel,
+        };
+      }
+
+      const msg = data?.error?.message || `Gemini API hatası (HTTP ${res.status})`;
+      lastError = new Error(msg);
+
+      const isOverloaded =
+        res.status === 503 ||
+        res.status === 429 ||
+        /high demand|overloaded|temporarily unavailable/i.test(msg);
+
+      if (isOverloaded && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, attempt * 2500));
+        continue;
+      }
+
+      // If model is overloaded or unavailable on this candidate, try next fallback model
+      if (isOverloaded || res.status === 404) {
+        break;
+      }
+
+      throw lastError;
+    }
   }
 
-  const text = data?.candidates?.[0]?.content?.parts
-    ?.map((p) => p.text || '')
-    .join('')
-    .trim();
-  if (!text) {
-    throw new Error('Gemini boş yanıt döndürdü.');
-  }
-
-  const usageMeta = data?.usageMetadata || {};
-  return {
-    parsed: parseJsonFromGeminiText(text),
-    promptTokens: Number(usageMeta.promptTokenCount || 0),
-    outputTokens: Number(usageMeta.candidatesTokenCount || 0),
-  };
+  throw lastError;
 }
 
 async function uploadBufferToGeminiFiles(buffer, mimeType, displayName) {
@@ -611,13 +827,12 @@ async function handleAnalyzeVideoUrl(req, res) {
       }
     }
 
-    // STAGE 1: If description already contains full ingredients + steps -> tiny text-only call with flash-lite!
+    // STAGE 1: If description already contains full ingredients + steps -> tiny text-only call!
     if (meta?.description && captionLooksLikeCompleteRecipe(meta.description)) {
-      const { parsed, promptTokens, outputTokens } = await callGemini(GEMINI_TEXT_MODEL, [
-        {
-          text: `${RECIPE_JSON_PROMPT}\n\nAşağıdaki gönderi açıklamasından tarifi eksiksiz çıkar. Eğer açıklama yetersizse needsVisualAnalysis: true döndür.\n\nBaşlık: ${meta.title || ''}\nAçıklama:\n${meta.description.slice(0, 6000)}`,
-        },
-      ]);
+      const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+        kind: 'text',
+        prompt: `${RECIPE_JSON_PROMPT}\n\nAşağıdaki gönderi açıklamasından tarifi eksiksiz çıkar. Eğer açıklama yetersizse needsVisualAnalysis: true döndür.\n\nBaşlık: ${meta.title || ''}\nAçıklama:\n${meta.description.slice(0, 6000)}`,
+      });
 
       if (!parsed.needsVisualAnalysis && Array.isArray(parsed.ingredients) && parsed.ingredients.length >= 2) {
         const draft = normalizeGeminiRecipe(parsed, {
@@ -629,7 +844,7 @@ async function handleAnalyzeVideoUrl(req, res) {
         const usage = recordUsage({
           userId,
           stage: 'caption_lite',
-          model: GEMINI_TEXT_MODEL,
+          model: usedModel || GEMINI_TEXT_MODEL,
           promptTokens,
           outputTokens,
           freeStarterCredits: FREE_STARTER_CREDITS,
@@ -673,14 +888,13 @@ async function handleAnalyzeVideoUrl(req, res) {
           }
         } else if (isYouTube) {
           // YouTube direct fallback if yt-dlp blocked by YouTube bot-check on cloud IP
-          const { parsed, promptTokens, outputTokens } = await callGemini(GEMINI_MEDIA_MODEL, [
-            { fileData: { fileUri: normalizedUrl } },
-            {
-              text: `${RECIPE_JSON_PROMPT}\n\nYouTube videosunu izleyip dinleyerek tarifi çıkar.${
-                title ? `\nBaşlık: ${title}` : ''
-              }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
-            },
-          ]);
+          const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+            kind: 'youtube',
+            youtubeUrl: normalizedUrl,
+            prompt: `${RECIPE_JSON_PROMPT}\n\nYouTube videosunu izleyip dinleyerek tarifi çıkar.${
+              title ? `\nBaşlık: ${title}` : ''
+            }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
+          });
           const draft = normalizeGeminiRecipe(parsed, {
             title,
             imageUri: thumbnail,
@@ -690,7 +904,7 @@ async function handleAnalyzeVideoUrl(req, res) {
           const usage = recordUsage({
             userId,
             stage: 'youtube_direct',
-            model: GEMINI_MEDIA_MODEL,
+            model: usedModel || GEMINI_MEDIA_MODEL,
             promptTokens,
             outputTokens,
             freeStarterCredits: FREE_STARTER_CREDITS,
@@ -698,7 +912,7 @@ async function handleAnalyzeVideoUrl(req, res) {
           sendJson(res, 200, {
             ok: true,
             analysisMode: 'youtube_direct',
-            costNote: 'YouTube videosu doğrudan Gemini ile analiz edildi.',
+            costNote: 'YouTube videosu doğrudan yapay zekâ ile analiz edildi.',
             draft,
             usage,
           });
@@ -719,17 +933,16 @@ async function handleAnalyzeVideoUrl(req, res) {
         const mp3Path = await compressToSpeechMp3(downloadedVideoPath, downloadedTmpDir);
         const mp3Buf = fs.readFileSync(mp3Path);
         if (mp3Buf.length > 2000) {
-          const audioUpload = await uploadBufferToGeminiFiles(mp3Buf, 'audio/mpeg', 'speech.mp3');
-          uploadedFiles.push(audioUpload.name);
-
-          const { parsed, promptTokens, outputTokens } = await callGemini(GEMINI_MEDIA_MODEL, [
-            { fileData: { mimeType: 'audio/mpeg', fileUri: audioUpload.uri } },
-            {
-              text: `${RECIPE_JSON_PROMPT}\n\nBu ses kaydındaki sözlü tarif anlatımını ve varsa aşağıdaki açıklamayı analiz et. Eğer ses sadece müzik/efekt ise ve tarif anlatılmıyorsa mutlaka "needsVisualAnalysis": true döndür.${
-                title ? `\nBaşlık: ${title}` : ''
-              }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
-            },
-          ]);
+          const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+            kind: 'audio',
+            buffer: mp3Buf,
+            mimeType: 'audio/mpeg',
+            fileName: 'speech.mp3',
+            uploadedFiles,
+            prompt: `${RECIPE_JSON_PROMPT}\n\nBu ses kaydındaki sözlü tarif anlatımını ve varsa aşağıdaki açıklamayı analiz et. Eğer ses sadece müzik/efekt ise ve tarif anlatılmıyorsa mutlaka "needsVisualAnalysis": true döndür.${
+              title ? `\nBaşlık: ${title}` : ''
+            }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
+          });
 
           if (
             !parsed.needsVisualAnalysis &&
@@ -747,7 +960,7 @@ async function handleAnalyzeVideoUrl(req, res) {
             const usage = recordUsage({
               userId,
               stage: 'audio_compressed',
-              model: GEMINI_MEDIA_MODEL,
+              model: usedModel || GEMINI_MEDIA_MODEL,
               promptTokens,
               outputTokens,
               freeStarterCredits: FREE_STARTER_CREDITS,
@@ -769,17 +982,16 @@ async function handleAnalyzeVideoUrl(req, res) {
       // STAGE 3: Low-FPS 480p Visual Video Analysis (for silent/text-overlay Reels & videos!)
       const compactPath = await compressToLowFpsVideo(downloadedVideoPath, downloadedTmpDir);
       const compactBuf = fs.readFileSync(compactPath);
-      const videoUpload = await uploadBufferToGeminiFiles(compactBuf, 'video/mp4', 'compact.mp4');
-      uploadedFiles.push(videoUpload.name);
-
-      const { parsed, promptTokens, outputTokens } = await callGemini(GEMINI_MEDIA_MODEL, [
-        { fileData: { mimeType: 'video/mp4', fileUri: videoUpload.uri } },
-        {
-          text: `${RECIPE_JSON_PROMPT}\n\nVideodaki ekrana yazılan tüm malzemeleri, yapılan görsel adımları ve sesi birlikte analiz ederek eksiksiz tarifi çıkar.${
-            title ? `\nBaşlık: ${title}` : ''
-          }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
-        },
-      ]);
+      const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+        kind: 'video',
+        buffer: compactBuf,
+        mimeType: 'video/mp4',
+        fileName: 'compact.mp4',
+        uploadedFiles,
+        prompt: `${RECIPE_JSON_PROMPT}\n\nVideodaki ekrana yazılan tüm malzemeleri, yapılan görsel adımları ve sesi birlikte analiz ederek eksiksiz tarifi çıkar.${
+          title ? `\nBaşlık: ${title}` : ''
+        }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
+      });
 
       const draft = normalizeGeminiRecipe(parsed, {
         title,
@@ -790,7 +1002,7 @@ async function handleAnalyzeVideoUrl(req, res) {
       const usage = recordUsage({
         userId,
         stage: 'video_visual',
-        model: GEMINI_MEDIA_MODEL,
+        model: usedModel || GEMINI_MEDIA_MODEL,
         promptTokens,
         outputTokens,
         freeStarterCredits: FREE_STARTER_CREDITS,
@@ -860,12 +1072,12 @@ async function handleAnalyzeMedia(req, res) {
     const buffer = Buffer.from(cleanBase64, 'base64');
 
     if (mimeType.startsWith('image/') && buffer.length < 12 * 1024 * 1024) {
-      const { parsed, promptTokens, outputTokens } = await callGemini(GEMINI_MEDIA_MODEL, [
-        { inlineData: { mimeType, data: cleanBase64 } },
-        {
-          text: `${RECIPE_JSON_PROMPT}\n\nBu fotoğraftaki/ekran görüntüsündeki tarifi analiz ederek eksiksiz Türkçe tarif JSON'u oluştur.`,
-        },
-      ]);
+      const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+        kind: 'image',
+        base64: cleanBase64,
+        mimeType,
+        prompt: `${RECIPE_JSON_PROMPT}\n\nBu fotoğraftaki/ekran görüntüsündeki tarifi analiz ederek eksiksiz Türkçe tarif JSON'u oluştur.`,
+      });
       const draft = normalizeGeminiRecipe(parsed, {
         imageUri: `data:${mimeType};base64,${cleanBase64}`,
       });
@@ -873,7 +1085,7 @@ async function handleAnalyzeMedia(req, res) {
       const usage = recordUsage({
         userId,
         stage: 'image_ai',
-        model: GEMINI_MEDIA_MODEL,
+        model: usedModel || GEMINI_MEDIA_MODEL,
         promptTokens,
         outputTokens,
         freeStarterCredits: FREE_STARTER_CREDITS,
@@ -908,22 +1120,21 @@ async function handleAnalyzeMedia(req, res) {
       }
     }
 
-    const uploaded = await uploadBufferToGeminiFiles(finalBuf, finalMime, fileName);
-    uploadedFiles.push(uploaded.name);
-
-    const { parsed, promptTokens, outputTokens } = await callGemini(GEMINI_MEDIA_MODEL, [
-      { fileData: { mimeType: uploaded.mimeType || finalMime, fileUri: uploaded.uri } },
-      {
-        text: `${RECIPE_JSON_PROMPT}\n\nBu videodaki konuşmayı dinle, ekrandaki yazıları ve yapılan işlemleri izle, eksiksiz Türkçe tarifi JSON olarak çıkar.`,
-      },
-    ]);
+    const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+      kind: 'video',
+      buffer: finalBuf,
+      mimeType: finalMime,
+      fileName,
+      uploadedFiles,
+      prompt: `${RECIPE_JSON_PROMPT}\n\nBu videodaki konuşmayı dinle, ekrandaki yazıları ve yapılan işlemleri izle, eksiksiz Türkçe tarifi JSON olarak çıkar.`,
+    });
 
     const draft = normalizeGeminiRecipe(parsed);
     draft.sourceType = 'manual';
     const usage = recordUsage({
       userId,
       stage: 'uploaded_video_ai',
-      model: GEMINI_MEDIA_MODEL,
+      model: usedModel || GEMINI_MEDIA_MODEL,
       promptTokens,
       outputTokens,
       freeStarterCredits: FREE_STARTER_CREDITS,
@@ -1027,13 +1238,15 @@ const server = http.createServer(async (req, res) => {
     const userId = String(req.headers['x-user-id'] || 'default-user').slice(0, 64);
     const metrics = loadMetrics();
     const today = new Date().toISOString().slice(0, 10);
+    const provider = getActiveProvider();
     sendJson(res, 200, {
       ok: true,
-      serverConfigured: Boolean(getGeminiApiKey()),
+      serverConfigured: provider !== 'none',
+      provider,
       hasYtDlp: Boolean(ytDlp),
       hasFfmpeg: ffmpeg,
-      textModel: GEMINI_TEXT_MODEL,
-      mediaModel: GEMINI_MEDIA_MODEL,
+      textModel: provider === 'openrouter' ? OPENROUTER_TEXT_MODEL : GEMINI_TEXT_MODEL,
+      mediaModel: provider === 'openrouter' ? OPENROUTER_MEDIA_MODEL : GEMINI_MEDIA_MODEL,
       payAsYouGo: {
         requireCredits: REQUIRE_CREDITS,
         remainingCredits: getUserCredits(userId, FREE_STARTER_CREDITS),
@@ -1096,8 +1309,15 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Tarif Defterim Backend hazir: http://localhost:${PORT}`);
+  const provider = getActiveProvider();
   console.log(
-    `Gemini API: ${getGeminiApiKey() ? 'AKTIF (Sunucu .env)' : 'TANIMLI DEGIL (.env dosyasina GEMINI_API_KEY ekleyin)'}`
+    `AI Saglayici: ${
+      provider === 'openrouter'
+        ? `OPENROUTER AKTIF (${OPENROUTER_MEDIA_MODEL})`
+        : provider === 'gemini'
+          ? `GEMINI DIRECT AKTIF (${GEMINI_MEDIA_MODEL})`
+          : 'TANIMLI DEGIL (OPENROUTER_API_KEY veya GEMINI_API_KEY ekleyin)'
+    }`
   );
   console.log(`Maliyet koruma gunluk limiti: $${DAILY_BUDGET_USD.toFixed(2)} | Kredi modu: ${REQUIRE_CREDITS}`);
 });

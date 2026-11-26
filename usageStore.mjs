@@ -10,8 +10,13 @@ const METRICS_FILE = path.join(DATA_DIR, 'usage_metrics.json');
 // Approximate Pay-as-you-go Gemini pricing (USD per 1M tokens)
 // Used for live cost tracking & daily budget protection
 const MODEL_PRICING = {
+  'gemini-3.8-flash': { inputPer1M: 0.3, outputPer1M: 2.5 },
   'gemini-2.5-flash-lite': { inputPer1M: 0.1, outputPer1M: 0.4 },
   'gemini-2.5-flash': { inputPer1M: 0.3, outputPer1M: 2.5 },
+  'google/gemini-3.5-flash-lite': { inputPer1M: 0.1, outputPer1M: 0.4 },
+  'google/gemini-2.5-flash': { inputPer1M: 0.3, outputPer1M: 2.5 },
+  'google/gemini-3.8-flash': { inputPer1M: 0.3, outputPer1M: 2.5 },
+  'google/gemini-flash-latest': { inputPer1M: 0.3, outputPer1M: 2.5 },
 };
 
 // Credit costs per analysis stage (for Pay-as-you-go user metering)
