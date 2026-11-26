@@ -1,0 +1,12 @@
+{
+  "name": "tarif-defterim-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Cloud backend for Tarif Defterim with 3-stage cost-optimized Gemini video/Instagram/web recipe extraction and pay-as-you-go metering.",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
