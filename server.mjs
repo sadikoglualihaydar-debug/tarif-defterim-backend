@@ -413,7 +413,17 @@ async function analyzeWithAi({
     }
 
     blocks.push({ type: 'text', text: prompt });
-    return callOpenRouter(model, blocks);
+
+    try {
+      return await callOpenRouter(model, blocks);
+    } catch (orErr) {
+      const orMsg = orErr instanceof Error ? orErr.message : String(orErr);
+      console.error(`[OpenRouter fallback check] ${orMsg}`);
+      // If OpenRouter failed (e.g. $1.00 video balance limit / 402 / rate limit) and GEMINI_API_KEY is available, fall back to Direct Gemini!
+      if (!getGeminiApiKey()) {
+        throw orErr;
+      }
+    }
   }
 
   // Direct Google Gemini API path
@@ -967,16 +977,25 @@ async function handleAnalyzeVideoUrl(req, res) {
     }
 
     if (downloadedVideoPath && ffmpegReady && downloadedTmpDir) {
+      let ocrFallbackDraft = null;
+      let ocrFrameCount = 0;
+
       // STAGE 1.5 (0 TL OCR): Extract keyframes & read on-screen Turkish/English recipe text with Tesseract!
       if (preferOcr && tesseractReady) {
         try {
           const ocrRes = await ocrVideoKeyframes(downloadedVideoPath, downloadedTmpDir);
+          ocrFrameCount = ocrRes.frameCount;
           const mergedText = [title, caption, ocrRes.text].filter(Boolean).join('\n\n');
           const ocrParsed = parseRecipeFromOcrText(mergedText, {
             title,
             imageUri: thumbnail,
             sourceUrl: normalizedUrl,
           });
+
+          if (ocrParsed._ocrQuality.charCount >= 25) {
+            const { _ocrQuality, ...cleanDraft } = ocrParsed;
+            ocrFallbackDraft = cleanDraft;
+          }
 
           if (ocrParsed._ocrQuality.ingredientCount >= 2 && ocrParsed._ocrQuality.stepCount >= 1) {
             const { _ocrQuality, ...draft } = ocrParsed;
@@ -997,9 +1016,8 @@ async function handleAnalyzeVideoUrl(req, res) {
             return;
           }
 
-          // If OCR extracted decent text (>=80 chars) and no AI provider is configured, still return OCR result!
-          if (ocrParsed._ocrQuality.charCount >= 60 && getActiveProvider() === 'none') {
-            const { _ocrQuality, ...draft } = ocrParsed;
+          // If OCR extracted decent text and no AI provider is configured, return OCR result immediately!
+          if (ocrFallbackDraft && getActiveProvider() === 'none') {
             const usage = recordUsage({
               userId,
               stage: 'ocr_free',
@@ -1010,13 +1028,13 @@ async function handleAnalyzeVideoUrl(req, res) {
               ok: true,
               analysisMode: 'ocr_free',
               costNote: `Ücretsiz Tesseract Video OCR (${ocrRes.frameCount} kare, 0 TL). Eksik alanları düzenleyebilirsiniz.`,
-              draft,
+              draft: ocrFallbackDraft,
               usage,
             });
             return;
           }
-        } catch {
-          // Proceed to Stage 2 AI audio analysis if OCR fails
+        } catch (ocrErr) {
+          console.error('[OCR Stage 1.5 error]', ocrErr instanceof Error ? ocrErr.message : ocrErr);
         }
       }
 
@@ -1067,46 +1085,67 @@ async function handleAnalyzeVideoUrl(req, res) {
             return;
           }
         }
-      } catch {
-        // Proceed to Stage 3 visual video fallback
+      } catch (audioErr) {
+        console.error('[Audio Stage 2 error]', audioErr instanceof Error ? audioErr.message : audioErr);
       }
 
       // STAGE 3: Low-FPS 480p Visual Video Analysis (for silent/text-overlay Reels & videos!)
-      const compactPath = await compressToLowFpsVideo(downloadedVideoPath, downloadedTmpDir);
-      const compactBuf = fs.readFileSync(compactPath);
-      const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
-        kind: 'video',
-        buffer: compactBuf,
-        mimeType: 'video/mp4',
-        fileName: 'compact.mp4',
-        uploadedFiles,
-        prompt: `${RECIPE_JSON_PROMPT}\n\nVideodaki ekrana yazılan tüm malzemeleri, yapılan görsel adımları ve sesi birlikte analiz ederek eksiksiz tarifi çıkar.${
-          title ? `\nBaşlık: ${title}` : ''
-        }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
-      });
+      try {
+        const compactPath = await compressToLowFpsVideo(downloadedVideoPath, downloadedTmpDir);
+        const compactBuf = fs.readFileSync(compactPath);
+        const { parsed, promptTokens, outputTokens, usedModel } = await analyzeWithAi({
+          kind: 'video',
+          buffer: compactBuf,
+          mimeType: 'video/mp4',
+          fileName: 'compact.mp4',
+          uploadedFiles,
+          prompt: `${RECIPE_JSON_PROMPT}\n\nVideodaki ekrana yazılan tüm malzemeleri, yapılan görsel adımları ve sesi birlikte analiz ederek eksiksiz tarifi çıkar.${
+            title ? `\nBaşlık: ${title}` : ''
+          }${caption ? `\nAçıklama:\n${caption.slice(0, 3000)}` : ''}`,
+        });
 
-      const draft = normalizeGeminiRecipe(parsed, {
-        title,
-        imageUri: thumbnail,
-        sourceUrl: normalizedUrl,
-      });
-      setCachedRecipe(normalizedUrl, draft);
-      const usage = recordUsage({
-        userId,
-        stage: 'video_visual',
-        model: usedModel || GEMINI_MEDIA_MODEL,
-        promptTokens,
-        outputTokens,
-        freeStarterCredits: FREE_STARTER_CREDITS,
-      });
-      sendJson(res, 200, {
-        ok: true,
-        analysisMode: 'video_visual',
-        costNote: 'Aşama 3 (1 FPS 480p Görsel+Ses): Ekrandaki yazılar ve video birlikte çözüldü.',
-        draft,
-        usage,
-      });
-      return;
+        const draft = normalizeGeminiRecipe(parsed, {
+          title,
+          imageUri: thumbnail,
+          sourceUrl: normalizedUrl,
+        });
+        setCachedRecipe(normalizedUrl, draft);
+        const usage = recordUsage({
+          userId,
+          stage: 'video_visual',
+          model: usedModel || GEMINI_MEDIA_MODEL,
+          promptTokens,
+          outputTokens,
+          freeStarterCredits: FREE_STARTER_CREDITS,
+        });
+        sendJson(res, 200, {
+          ok: true,
+          analysisMode: 'video_visual',
+          costNote: 'Aşama 3 (1 FPS 480p Görsel+Ses): Ekrandaki yazılar ve video birlikte çözüldü.',
+          draft,
+          usage,
+        });
+        return;
+      } catch (videoErr) {
+        console.error('[Video Stage 3 error]', videoErr instanceof Error ? videoErr.message : videoErr);
+        if (ocrFallbackDraft) {
+          const usage = recordUsage({
+            userId,
+            stage: 'ocr_free',
+            model: 'none',
+            freeStarterCredits: FREE_STARTER_CREDITS,
+          });
+          sendJson(res, 200, {
+            ok: true,
+            analysisMode: 'ocr_free',
+            costNote: `Ücretsiz Tesseract OCR (${ocrFrameCount} kare, 0 TL) döndürüldü — AI bakiye/yoğunluk nedeniyle devre dışı kaldı.`,
+            draft: ocrFallbackDraft,
+            usage,
+          });
+          return;
+        }
+        throw videoErr;
+      }
     }
 
     sendJson(res, 422, {
